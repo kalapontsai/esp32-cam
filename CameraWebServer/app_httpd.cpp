@@ -1,16 +1,7 @@
-// Copyright 2015-2016 Espressif Systems (Shanghai) PTE LTD
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+//2025-12-04 modify wifi STA / AP mode server function
+//添加了 /wifi/status API 端点：获取 WiFi 状态（连接状态、STA IP、AP IP）
+//添加了 /wifi/config API 端点：接收 POST 请求，设置 WiFi 并连接，保存到 EEPROM
+//修改了 /status API：在返回的 JSON 中添加了 WiFi 状态信息（wifi_connected、sta_ip、ap_ip）
 #include "esp_http_server.h"
 #include "esp_timer.h"
 #include "esp_camera.h"
@@ -20,10 +11,17 @@
 #include "sdkconfig.h"
 #include "camera_index.h"
 #include "board_config.h"
+#include <WiFi.h>
+#include <Arduino.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
 #endif
+
+// 外部全局变量声明
+extern bool wifiConnected;
+extern String staIP;
+extern void manualConnectWiFi(const String &ssid, const String &password);
 
 // LED FLASH setup
 #if defined(LED_GPIO_NUM)
@@ -414,6 +412,103 @@ static int print_reg(char *p, sensor_t *s, uint16_t reg, uint32_t mask) {
   return sprintf(p, "\"0x%x\":%u,", reg, s->get_reg(s, reg, mask));
 }
 
+// WiFi配置handler - 获取WiFi状态
+static esp_err_t wifi_status_handler(httpd_req_t *req) {
+  static char json_response[512];
+  char *p = json_response;
+  *p++ = '{';
+  
+  p += sprintf(p, "\"wifi_connected\":%s,", wifiConnected ? "true" : "false");
+  if (wifiConnected && staIP.length() > 0) {
+    p += sprintf(p, "\"sta_ip\":\"%s\",", staIP.c_str());
+  } else {
+    p += sprintf(p, "\"sta_ip\":\"\",");
+  }
+  p += sprintf(p, "\"ap_ip\":\"%s\"", WiFi.softAPIP().toString().c_str());
+  
+  *p++ = '}';
+  *p++ = 0;
+  
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json_response, strlen(json_response));
+}
+
+// WiFi配置handler - 设置WiFi并连接
+static esp_err_t wifi_config_handler(httpd_req_t *req) {
+  char content[256];
+  size_t recv_size = sizeof(content);
+  
+  // 读取POST数据
+  int ret = httpd_req_recv(req, content, recv_size);
+  if (ret <= 0) {
+    if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+      httpd_resp_send_408(req);
+    }
+    return ESP_FAIL;
+  }
+  
+  content[ret] = '\0';
+  
+  // 解析JSON数据 (简单解析，实际应该使用JSON库)
+  String ssid = "";
+  String password = "";
+  
+  // 查找ssid和password字段
+  char *ssid_start = strstr(content, "\"ssid\":\"");
+  char *pass_start = strstr(content, "\"password\":\"");
+  
+  if (ssid_start) {
+    ssid_start += 8; // 跳过 "ssid":"
+    char *ssid_end = strstr(ssid_start, "\"");
+    if (ssid_end) {
+      int len = ssid_end - ssid_start;
+      char ssid_buf[64];
+      strncpy(ssid_buf, ssid_start, len);
+      ssid_buf[len] = '\0';
+      ssid = String(ssid_buf);
+    }
+  }
+  
+  if (pass_start) {
+    pass_start += 11; // 跳过 "password":"
+    char *pass_end = strstr(pass_start, "\"");
+    if (pass_end) {
+      int len = pass_end - pass_start;
+      char pass_buf[64];
+      strncpy(pass_buf, pass_start, len);
+      pass_buf[len] = '\0';
+      password = String(pass_buf);
+    }
+  }
+  
+  // 调用手动连接函数
+  if (ssid.length() > 0) {
+    manualConnectWiFi(ssid, password);
+    
+    // 返回结果
+    static char json_response[256];
+    char *p = json_response;
+    *p++ = '{';
+    p += sprintf(p, "\"success\":%s,", wifiConnected ? "true" : "false");
+    if (wifiConnected) {
+      p += sprintf(p, "\"sta_ip\":\"%s\"", staIP.c_str());
+    } else {
+      p += sprintf(p, "\"error\":\"连接失败\"");
+    }
+    *p++ = '}';
+    *p++ = 0;
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, json_response, strlen(json_response));
+  } else {
+    httpd_resp_set_status(req, "400 Bad Request");
+    httpd_resp_send(req, "Invalid request", HTTPD_RESP_USE_STRLEN);
+    return ESP_FAIL;
+  }
+}
+
 static esp_err_t status_handler(httpd_req_t *req) {
   static char json_response[1024];
 
@@ -482,6 +577,14 @@ static esp_err_t status_handler(httpd_req_t *req) {
 #else
   p += sprintf(p, ",\"led_intensity\":%d", -1);
 #endif
+  // 添加WiFi状态信息
+  p += sprintf(p, ",\"wifi_connected\":%s", wifiConnected ? "true" : "false");
+  if (wifiConnected && staIP.length() > 0) {
+    p += sprintf(p, ",\"sta_ip\":\"%s\"", staIP.c_str());
+  } else {
+    p += sprintf(p, ",\"sta_ip\":\"\"");
+  }
+  p += sprintf(p, ",\"ap_ip\":\"%s\"", WiFi.softAPIP().toString().c_str());
   *p++ = '}';
   *p++ = 0;
   httpd_resp_set_type(req, "application/json");
@@ -814,6 +917,20 @@ void startCameraServer() {
 #endif
   };
 
+  httpd_uri_t wifi_status_uri = {
+    .uri = "/wifi/status",
+    .method = HTTP_GET,
+    .handler = wifi_status_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t wifi_config_uri = {
+    .uri = "/wifi/config",
+    .method = HTTP_POST,
+    .handler = wifi_config_handler,
+    .user_ctx = NULL
+  };
+
   ra_filter_init(&ra_filter, 20);
 
   log_i("Starting web server on port: '%d'", config.server_port);
@@ -829,6 +946,8 @@ void startCameraServer() {
     httpd_register_uri_handler(camera_httpd, &greg_uri);
     httpd_register_uri_handler(camera_httpd, &pll_uri);
     httpd_register_uri_handler(camera_httpd, &win_uri);
+    httpd_register_uri_handler(camera_httpd, &wifi_status_uri);
+    httpd_register_uri_handler(camera_httpd, &wifi_config_uri);
   }
 
   config.server_port += 1;
