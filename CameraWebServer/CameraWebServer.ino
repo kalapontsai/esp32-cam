@@ -1,17 +1,5 @@
-//2025-12-04 modify wifi STA / AP mode server function
-//添加了 Preferences 库用于 EEPROM 读写
-//添加了 WiFi 配置的 EEPROM 存储功能
-//实现了从 EEPROM 读取 WiFi 配置的功能
-//修改了 setup() 函数：
-//开机时从 EEPROM 读取 SSID 和密码
-//尝试连接 WiFi
-//连接成功：启动 STA+AP 模式
-//连接失败：仅启动 AP 模式
-//添加了 manualConnectWiFi() 函数，供网页调用进行手动连接
-
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <Preferences.h>
 
 // ===========================
 // Select camera model in board_config.h
@@ -19,27 +7,24 @@
 #include "board_config.h"
 
 // ===========================
-// WiFi EEPROM Storage
+// WiFi 憑證陣列 (按優先順序)
 // ===========================
-Preferences preferences;
-const char* PREF_NAMESPACE = "wifi_config";
-const char* PREF_SSID_KEY = "ssid";
-const char* PREF_PASS_KEY = "password";
+struct WiFiCredential {
+  const char* ssid;
+  const char* password;
+};
 
-// AP模式配置
-const char* AP_SSID = "ESP32-CAM";
-const char* AP_PASSWORD = "12345678";
-
-// WiFi状态（全局变量，供app_httpd.cpp使用）
-bool wifiConnected = false;
-String staIP = "";
+// 多組 WiFi 憑證，依優先順序排列
+const WiFiCredential wifi_credentials[] = {
+  {"ssid1", "12345678"},           // 優先級 1
+  {"ssid2", "12345678"}, // 優先級 2
+  // 可繼續新增更多憑證
+  // {"OtherSSID", "password"},
+};
+const int num_credentials = sizeof(wifi_credentials) / sizeof(wifi_credentials[0]);
 
 void startCameraServer();
 void setupLedFlash();
-bool loadWiFiFromEEPROM(String &ssid, String &password);
-void saveWiFiToEEPROM(const String &ssid, const String &password);
-bool connectToWiFi(const String &ssid, const String &password);
-void manualConnectWiFi(const String &ssid, const String &password);
 
 void setup() {
   Serial.begin(115200);
@@ -66,12 +51,12 @@ void setup() {
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_UXGA;
+  config.frame_size = FRAMESIZE_QVGA;
   config.pixel_format = PIXFORMAT_JPEG;  // for streaming
   //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
+  config.jpeg_quality = 10;
   config.fb_count = 1;
 
   // if PSRAM IC present, init with UXGA resolution and higher JPEG quality
@@ -132,135 +117,59 @@ void setup() {
   setupLedFlash();
 #endif
 
-  // 初始化EEPROM
-  preferences.begin(PREF_NAMESPACE, false);
-  
-  // 从EEPROM读取WiFi配置
-  String ssid = "";
-  String password = "";
-  
-  if (loadWiFiFromEEPROM(ssid, password) && ssid.length() > 0) {
-    Serial.println("从EEPROM读取WiFi配置:");
-    Serial.print("SSID: ");
-    Serial.println(ssid);
-    
-    // 尝试连接WiFi
-    Serial.print("正在连接WiFi...");
-    if (connectToWiFi(ssid, password)) {
-      wifiConnected = true;
-      staIP = WiFi.localIP().toString();
-      Serial.println("");
-      Serial.println("WiFi连接成功!");
-      Serial.print("STA IP: ");
-      Serial.println(staIP);
-      
-      // 连接成功后，启动STA+AP模式
-      WiFi.mode(WIFI_AP_STA);
-      WiFi.softAP(AP_SSID, AP_PASSWORD);
-      Serial.print("AP模式已启动: ");
-      Serial.print(AP_SSID);
-      Serial.print(", AP IP: ");
-      Serial.println(WiFi.softAPIP());
-    } else {
-      Serial.println("");
-      Serial.println("WiFi连接失败，仅启动AP模式");
-      wifiConnected = false;
-      staIP = "";
-      // 连接失败，仅启动AP模式
-      WiFi.mode(WIFI_AP);
-      WiFi.softAP(AP_SSID, AP_PASSWORD);
-      Serial.print("AP模式已启动: ");
-      Serial.print(AP_SSID);
-      Serial.print(", AP IP: ");
-      Serial.println(WiFi.softAPIP());
-    }
-  } else {
-    Serial.println("EEPROM中没有WiFi配置，启动AP模式");
-    wifiConnected = false;
-    staIP = "";
-    // 没有配置，仅启动AP模式
-    WiFi.mode(WIFI_AP);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.print("AP模式已启动: ");
-    Serial.print(AP_SSID);
-    Serial.print(", AP IP: ");
-    Serial.println(WiFi.softAPIP());
-  }
-  
   WiFi.setSleep(false);
+
+  // 依優先順序嘗試連線
+  bool connected = false;
+  for (int i = 0; i < num_credentials; i++) {
+    Serial.printf("Attempting WiFi connection %d/%d: SSID='%s'\n", i + 1, num_credentials, wifi_credentials[i].ssid);
+    WiFi.begin(wifi_credentials[i].ssid, wifi_credentials[i].password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+    Serial.println("");
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("WiFi connected! SSID: %s, IP: %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
+      connected = true;
+      break;
+    } else {
+      Serial.printf("Failed to connect to %s\n", wifi_credentials[i].ssid);
+      WiFi.disconnect(true);  // 斷開並關閉 WiFi，為下次嘗試做準備
+      delay(1000);
+    }
+  }
+
+  if (!connected) {
+    Serial.println("All WiFi connection attempts failed. Entering AP-only mode.");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32-CAM", "39001678");
+    Serial.print("AP Mode - IP: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    // 連線成功，啟用 STA+AP 模式
+    Serial.println("Enabling STA+AP mode...");
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP("ESP32-CAM", "39001678");
+    Serial.print("AP Mode - IP: ");
+    Serial.println(WiFi.softAPIP());
+    Serial.print("STA Mode - IP: ");
+    Serial.println(WiFi.localIP());
+  }
 
   startCameraServer();
 
   Serial.print("Camera Ready! Use 'http://");
-  if (wifiConnected) {
-    Serial.print(staIP);
-    Serial.println("' (STA) or 'http://");
-    Serial.print(WiFi.softAPIP());
-    Serial.println("' (AP) to connect");
+  if (connected) {
+    Serial.print(WiFi.localIP());
+    Serial.println("' (STA) to connect");
   } else {
     Serial.print(WiFi.softAPIP());
     Serial.println("' (AP) to connect");
-  }
-}
-
-// 从EEPROM读取WiFi配置
-bool loadWiFiFromEEPROM(String &ssid, String &password) {
-  ssid = preferences.getString(PREF_SSID_KEY, "");
-  password = preferences.getString(PREF_PASS_KEY, "");
-  return (ssid.length() > 0);
-}
-
-// 保存WiFi配置到EEPROM
-void saveWiFiToEEPROM(const String &ssid, const String &password) {
-  preferences.putString(PREF_SSID_KEY, ssid);
-  preferences.putString(PREF_PASS_KEY, password);
-  preferences.end();
-  preferences.begin(PREF_NAMESPACE, false);
-  Serial.println("WiFi配置已保存到EEPROM");
-}
-
-// 连接WiFi
-bool connectToWiFi(const String &ssid, const String &password) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-  
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
-  }
-  
-  return (WiFi.status() == WL_CONNECTED);
-}
-
-// 手动连接WiFi（从网页调用）
-void manualConnectWiFi(const String &ssid, const String &password) {
-  Serial.println("手动连接WiFi...");
-  Serial.print("SSID: ");
-  Serial.println(ssid);
-  
-  if (connectToWiFi(ssid, password)) {
-    wifiConnected = true;
-    staIP = WiFi.localIP().toString();
-    Serial.println("WiFi连接成功!");
-    Serial.print("STA IP: ");
-    Serial.println(staIP);
-    
-    // 保存到EEPROM
-    saveWiFiToEEPROM(ssid, password);
-    
-    // 启动STA+AP模式
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.print("AP模式已启动: ");
-    Serial.print(AP_SSID);
-    Serial.print(", AP IP: ");
-    Serial.println(WiFi.softAPIP());
-  } else {
-    Serial.println("WiFi连接失败");
-    wifiConnected = false;
-    staIP = "";
   }
 }
 
