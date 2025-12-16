@@ -8,7 +8,12 @@
 ## create_videos
 . because i can't use 'glob' parameter to collect all the pictures in 'images' folder. so it will create a list.txt and read it one by one to process the timelapse animation video.
 
-##📸 ESP32-CAM 影像參數說明（含用途與建議）
+## connect link 
+. esp32-cam的串流影像 : http://<ESP32-CAM_IP>:81/stream
+
+. camera config : http://<ESP32-CAM_IP>.
+
+## ESP32-CAM 影像參數說明
 1. AWB（Auto White Balance，自動白平衡）
 
 功能：自動調整影像的色溫，使畫面中的白色看起來真正是白色。
